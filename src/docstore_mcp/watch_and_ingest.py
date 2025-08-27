@@ -17,25 +17,28 @@ DB_FOLDER = "/Users/johanneswiebe/dev/docstore/chroma_store"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 BATCH_SIZE = 10
 
-# Chroma client
-client = chromadb.PersistentClient(path=DB_FOLDER)
-collection = client.get_or_create_collection("pdf_docs")
+def get_chroma_client():
+    """Get or create ChromaDB client and collection."""
+    client = chromadb.PersistentClient(path=DB_FOLDER)
+    collection = client.get_or_create_collection("pdf_docs")
+    return client, collection
 
-# splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-splitter = TokenTextSplitter(
-    chunk_size=1000,  # max 1000 tokens per chunk
-    chunk_overlap=50,
-    encoding_name="cl100k_base"  # matches OpenAI embeddings
-)
+def get_text_splitter():
+    """Get configured text splitter."""
+    return TokenTextSplitter(
+        chunk_size=1000,  # max 1000 tokens per chunk
+        chunk_overlap=50,
+        encoding_name="cl100k_base"  # matches OpenAI embeddings
+    )
 
-# Get already ingested files
-existing_sources = set()
-res = collection.get(include=["metadatas"])
-for meta in res["metadatas"]:
-    if "source" in meta:
-        existing_sources.add(meta["source"])
-
-print("Already ingested:", existing_sources)
+def get_existing_sources(collection):
+    """Get already ingested files from collection."""
+    existing_sources = set()
+    res = collection.get(include=["metadatas"])
+    for meta in res["metadatas"]:
+        if "source" in meta:
+            existing_sources.add(meta["source"])
+    return existing_sources
 
 def hash_file(path):
     """Simple hash to avoid duplicate insertions."""
@@ -44,10 +47,12 @@ def hash_file(path):
         h.update(f.read())
     return h.hexdigest()
 
-def ingest_pdf(path):
+def ingest_pdf(path, collection, splitter, existing_sources):
+    """Ingest a PDF file into the collection."""
     if path.name in existing_sources:
         print(f"Skipping already ingested PDF: {path}")
         return
+    
     print(f"[INFO] Ingesting {path}")
     reader = PdfReader(path)
     raw_text = ""
@@ -74,28 +79,49 @@ def ingest_pdf(path):
         print(f"[INFO] Added batch {i//BATCH_SIZE+1} ({len(batch_docs)} chunks)")
 
 class PDFHandler(FileSystemEventHandler):
+    def __init__(self, collection, splitter, existing_sources):
+        self.collection = collection
+        self.splitter = splitter
+        self.existing_sources = existing_sources
+    
     def on_created(self, event):
         if event.is_directory:
             return
         if event.src_path.lower().endswith(".pdf"):
             time.sleep(1)  # wait for file write to finish
-            ingest_pdf(event.src_path)
+            ingest_pdf(Path(event.src_path), self.collection, self.splitter, self.existing_sources)
 
-if __name__ == "__main__":
+def main():
+    """Main function to run the watch and ingest process."""
     os.makedirs(WATCH_FOLDER, exist_ok=True)
-
-    for pdf_file in WATCH_FOLDER.glob("*pdf"):
-        ingest_pdf(pdf_file)
-
+    
+    # Initialize ChromaDB
+    client, collection = get_chroma_client()
+    splitter = get_text_splitter()
+    existing_sources = get_existing_sources(collection)
+    
+    print("Already ingested:", existing_sources)
+    
+    # Process existing PDFs
+    for pdf_file in WATCH_FOLDER.glob("*.pdf"):
+        ingest_pdf(pdf_file, collection, splitter, existing_sources)
+    
+    # Set up file watching
     observer = Observer()
-    event_handler = PDFHandler()
+    event_handler = PDFHandler(collection, splitter, existing_sources)
     observer.schedule(event_handler, str(WATCH_FOLDER), recursive=False)
     observer.start()
+    
     print(f"[INFO] Watching {WATCH_FOLDER} for PDFs...")
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
         observer.stop()
+        print("\n[INFO] Stopping file watcher...")
+    
     observer.join()
+    print("[INFO] File watcher stopped.")
 
+if __name__ == "__main__":
+    main() 
